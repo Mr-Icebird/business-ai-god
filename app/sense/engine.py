@@ -2,6 +2,8 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from app.sense.entity_engine import ENTITY_SENSE
+
 from app.sense.models import (
     ConversationEvent,
     IntentType,
@@ -208,6 +210,41 @@ class SenseEngine:
         context = self._detect_context(normalized)
         entities = self._detect_entities(normalized)
 
+        # Resolve the previous active entity for conversational references.
+        previous_entity = None
+
+        if previous_result is not None:
+            if (
+                previous_result.entity_sense is not None
+                and previous_result.entity_sense.references
+            ):
+                resolved_entities = [
+                    reference.refers_to
+                    for reference in previous_result.entity_sense.references
+                    if reference.refers_to
+                ]
+
+                if resolved_entities:
+                    previous_entity = resolved_entities[-1]
+
+            if (
+                previous_entity is None
+                and previous_result.entity_sense is not None
+            ):
+                mentioned_entities = [
+                    mention.text
+                    for mention in previous_result.entity_sense.mentions
+                    if mention.text
+                ]
+
+                if mentioned_entities:
+                    previous_entity = mentioned_entities[-1]
+
+        entity_sense = ENTITY_SENSE.understand(
+            cleaned,
+            previous_entity=previous_entity,
+        )
+
         ambiguous = any(
             entity in self.AMBIGUOUS_ENTITIES
             for entity in entities
@@ -255,76 +292,72 @@ class SenseEngine:
             addressed_to_baig=addressed_to_baig,
             requires_clarification=requires_clarification,
             explanation=explanation,
+            entity_sense=entity_sense,
         )
 
     def _detect_conversation_event(
         self,
-        message: str,
+        normalized: str,
     ) -> ConversationEvent:
-        """Detect conversational events."""
 
         if any(
-            re.search(pattern, message)
+            re.search(pattern, normalized)
             for pattern in self.DEFERRED_CONTINUATION_PATTERNS
         ):
             return ConversationEvent.DEFERRED_CONTINUATION
 
         if any(
-            re.search(pattern, message)
+            re.search(pattern, normalized)
             for pattern in self.FAREWELL_PATTERNS
         ):
             return ConversationEvent.FAREWELL
 
         if any(
-            re.search(pattern, message)
+            re.search(pattern, normalized)
             for pattern in self.GREETING_PATTERNS
         ):
             return ConversationEvent.GREETING
 
         if any(
-            re.search(pattern, message)
+            re.search(pattern, normalized)
             for pattern in self.CONTINUATION_PATTERNS
         ):
             return ConversationEvent.CONTINUATION
 
         if any(
-            re.search(pattern, message)
+            re.search(pattern, normalized)
             for pattern in self.ACKNOWLEDGEMENT_PATTERNS
         ):
             return ConversationEvent.ACKNOWLEDGEMENT
 
         if any(
-            re.search(pattern, message)
+            re.search(pattern, normalized)
             for pattern in self.CONFIRMATION_PATTERNS
         ):
             return ConversationEvent.CONFIRMATION
 
         if any(
-            re.search(pattern, message)
+            re.search(pattern, normalized)
             for pattern in self.NEGATION_PATTERNS
         ):
             return ConversationEvent.NEGATION
 
         if any(
-            re.search(pattern, message)
+            re.search(pattern, normalized)
             for pattern in self.ATTENTION_PATTERNS
         ):
             return ConversationEvent.ATTENTION
 
         return ConversationEvent.NONE
 
-    def _is_addressed_to_baig(self, message: str) -> bool:
-        """Determine whether the owner directly addressed BAIG."""
-
+    def _is_addressed_to_baig(self, normalized: str) -> bool:
         return any(
-            re.search(pattern, message)
+            re.search(pattern, normalized)
             for pattern in self.BAIG_ADDRESS_PATTERNS
         )
 
-    def _detect_time_period(self, now: datetime) -> TimePeriod:
-        """Convert local time into a conversational time period."""
-
-        hour = now.hour
+    def _detect_time_period(self, current_time: datetime) -> TimePeriod:
+        hour = current_time.hour
 
         if 5 <= hour < 12:
             return TimePeriod.MORNING
@@ -332,66 +365,52 @@ class SenseEngine:
         if 12 <= hour < 17:
             return TimePeriod.AFTERNOON
 
-        if 17 <= hour < 22:
+        if 17 <= hour < 21:
             return TimePeriod.EVENING
 
         return TimePeriod.NIGHT
 
-    def _detect_intent(self, message: str) -> IntentType:
-        """Detect the broad non-conversational intent."""
-
+    def _detect_intent(self, normalized: str) -> IntentType:
         for intent, patterns in self.INTENT_PATTERNS.items():
             if any(
-                re.search(pattern, message)
+                re.search(pattern, normalized)
                 for pattern in patterns
             ):
                 return intent
 
         return IntentType.UNKNOWN
 
-    def _detect_context(self, message: str) -> str:
-        """Detect basic time-related context."""
-
+    def _detect_context(self, normalized: str) -> str:
         if any(
-            re.search(pattern, message)
+            re.search(pattern, normalized)
             for pattern in self.CURRENT_CONTEXT_PATTERNS
         ):
-            return "current/general"
+            return "current"
 
-        return "general"
+        return "unknown"
 
-    def _detect_entities(self, message: str) -> list[str]:
-        """Detect currently supported high-level entities."""
-
-        found = []
+    def _detect_entities(self, normalized: str) -> list[str]:
+        entities = []
 
         for entity in self.AMBIGUOUS_ENTITIES:
             if re.search(
                 rf"\b{re.escape(entity)}\b",
-                message,
+                normalized,
             ):
-                found.append(entity)
+                entities.append(entity)
 
-        return found
+        return entities
 
     def _apply_previous_context(
         self,
         context: str,
         previous_result: SenseResult,
     ) -> str:
-        """Carry forward useful context from the immediately previous turn."""
-
-        if context != "general":
+        if context != "unknown":
             return context
 
-        if previous_result.entities:
-            return "continuation"
-
-        if previous_result.conversation_event in (
-            ConversationEvent.GREETING,
-            ConversationEvent.ATTENTION,
-        ):
-            return "conversation"
+        if previous_result.context != "unknown":
+            return previous_result.context
 
         return context
 
@@ -405,68 +424,50 @@ class SenseEngine:
         requires_clarification: bool,
         previous_result: SenseResult | None,
     ) -> str:
-        """Describe the current Sense interpretation."""
 
         if conversation_event == ConversationEvent.GREETING:
-            return (
-                f"Detected a greeting during the {time_period.value}. "
-                f"Addressed to BAIG: {addressed_to_baig}."
-            )
+            return "The owner is greeting BAIG."
 
         if conversation_event == ConversationEvent.FAREWELL:
-            return (
-                "Detected a conversation-ending farewell. "
-                f"Addressed to BAIG: {addressed_to_baig}."
-            )
+            return "The owner is ending the conversation."
 
         if conversation_event == ConversationEvent.DEFERRED_CONTINUATION:
-            return (
-                "The owner appears to be ending the current conversation "
-                "with an intention to continue later."
-            )
+            return "The owner wants to continue the conversation later."
 
         if conversation_event == ConversationEvent.CONTINUATION:
-            return (
-                "The owner appears to be asking BAIG to continue "
-                "the current conversation or explanation."
-            )
+            return "The owner wants BAIG to continue."
 
         if conversation_event == ConversationEvent.ACKNOWLEDGEMENT:
-            return "Detected an acknowledgement from the owner."
+            return "The owner acknowledges the previous response."
 
         if conversation_event == ConversationEvent.CONFIRMATION:
-            if previous_result is not None:
-                return (
-                    "Detected an affirmative response to the previous "
-                    "conversation context."
-                )
-
-            return "Detected an affirmative response from the owner."
+            return "The owner is confirming the previous context or question."
 
         if conversation_event == ConversationEvent.NEGATION:
-            if previous_result is not None:
-                return (
-                    "Detected a negative response to the previous "
-                    "conversation context."
-                )
-
-            return "Detected a negative response from the owner."
+            return "The owner is rejecting or correcting the previous context."
 
         if conversation_event == ConversationEvent.ATTENTION:
-            return "The owner appears to be calling or addressing BAIG."
+            return "The owner is directly getting BAIG's attention."
 
         if requires_clarification:
-            return (
-                "The message contains an entity whose economic scope "
-                "may require clarification before deeper processing."
-            )
+            return "The message contains an entity whose intended scope is ambiguous."
 
         if entities:
             return (
-                f"Detected intent '{intent.value}' and entity "
+                f"The message contains the entity or topic: "
                 f"{', '.join(entities)}."
             )
 
-        return f"Detected intent '{intent.value}'."
+        if addressed_to_baig:
+            return "The owner is addressing BAIG."
+
+        if previous_result is not None:
+            return "The message may depend on the previous conversational context."
+
+        if intent == IntentType.UNKNOWN:
+            return "SENSE could not determine a specific intent."
+
+        return f"SENSE classified the message as {intent.value}."
+
 
 SENSE = SenseEngine()

@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from enum import Enum
 
+from app.sense.entity_models import EntitySenseResult
+
 
 class IntentType(str, Enum):
     UNKNOWN = "unknown"
@@ -43,6 +45,8 @@ class SenseResult:
     """
     Structured representation of what BAIG SENSE understands
     about an owner's message.
+
+    Entity Sense is optional during the incremental SENSE build.
     """
 
     message: str
@@ -56,9 +60,10 @@ class SenseResult:
     requires_clarification: bool = False
     explanation: str = ""
 
-    def to_dict(self) -> dict:
-        """Convert the Sense result into a serializable dictionary."""
+    # Entity / reference / relationship understanding.
+    entity_sense: EntitySenseResult | None = None
 
+    def to_dict(self) -> dict:
         return {
             "message": self.message,
             "intent": self.intent.value,
@@ -70,4 +75,9 @@ class SenseResult:
             "addressed_to_baig": self.addressed_to_baig,
             "requires_clarification": self.requires_clarification,
             "explanation": self.explanation,
+            "entity_sense": (
+                self.entity_sense.to_dict()
+                if self.entity_sense
+                else None
+            ),
         }
