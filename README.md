@@ -20,3 +20,20 @@ The system will combine knowledge, live data, research, testing, risk management
 ## Project Status
 
 🚧 Foundation stage
+
+## SENSE pipeline
+
+SENSE processes each message through three connected stages:
+
+- **SENSE-1: Input understanding** preserves the original message, normalizes
+  text, and identifies language, numeric and date values, currencies, units,
+  URLs, symbols, and other input structure.
+- **SENSE-2: Intent understanding** identifies intent, tasks, goals, actions,
+  questions, constraints, conversation context, ambiguity, confidence, and
+  corrections.
+- **SENSE-3: Domain and scope understanding** classifies domains and scopes,
+  relates multi-domain concepts, tracks evidence and context, and evaluates
+  ambiguity, confidence, and corrections.
+
+The stages retain their upstream results so callers can inspect both the
+combined interpretation and the evidence supporting it.
