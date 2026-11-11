@@ -2,7 +2,11 @@
 BAIG Central System — Task and Workflow models.
 
 Implements the task lifecycle described in the Central System specification
-(Sections 7, 10 and 15).
+(Sections 7, 10 and 15) with stronger enforcement of Section 2 invariants:
+
+- No hidden transitions
+- Every state change records actor, reason, time, previous and new state
+- Invalid transitions are rejected
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Optional
 
 from app.central.models.authority import new_id
 
@@ -40,9 +44,76 @@ class TaskPriority(str, Enum):
     CRITICAL = "critical"
 
 
+# Allowed transitions (from_status → set of allowed to_status)
+# This enforces "No hidden / invalid transitions"
+ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
+    TaskStatus.RECEIVED: {
+        TaskStatus.VALIDATING,
+        TaskStatus.REJECTED,
+        TaskStatus.CANCELLED,
+    },
+    TaskStatus.VALIDATING: {
+        TaskStatus.PLANNED,
+        TaskStatus.AWAITING_APPROVAL,
+        TaskStatus.BLOCKED,
+        TaskStatus.REJECTED,
+        TaskStatus.CANCELLED,
+    },
+    TaskStatus.PLANNED: {
+        TaskStatus.AWAITING_APPROVAL,
+        TaskStatus.READY,
+        TaskStatus.BLOCKED,
+        TaskStatus.CANCELLED,
+    },
+    TaskStatus.AWAITING_APPROVAL: {
+        TaskStatus.READY,
+        TaskStatus.REJECTED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+    },
+    TaskStatus.READY: {
+        TaskStatus.RUNNING,
+        TaskStatus.BLOCKED,
+        TaskStatus.CANCELLED,
+        TaskStatus.PAUSED,
+    },
+    TaskStatus.RUNNING: {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.BLOCKED,
+        TaskStatus.PAUSED,
+        TaskStatus.RETRYING,
+        TaskStatus.CANCELLED,
+    },
+    TaskStatus.BLOCKED: {
+        TaskStatus.READY,
+        TaskStatus.AWAITING_APPROVAL,
+        TaskStatus.CANCELLED,
+        TaskStatus.FAILED,
+    },
+    TaskStatus.PAUSED: {
+        TaskStatus.READY,
+        TaskStatus.RUNNING,
+        TaskStatus.CANCELLED,
+        TaskStatus.FAILED,
+    },
+    TaskStatus.RETRYING: {
+        TaskStatus.RUNNING,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+    },
+    # Terminal states — no further transitions allowed
+    TaskStatus.COMPLETED: set(),
+    TaskStatus.FAILED: set(),
+    TaskStatus.CANCELLED: set(),
+    TaskStatus.REJECTED: set(),
+}
+
+
 @dataclass
 class TaskTransition:
-    """Record of a single status change."""
+    """Record of a single status change (supports traceability)."""
 
     from_status: TaskStatus
     to_status: TaskStatus
@@ -56,6 +127,11 @@ class TaskTransition:
 class Task:
     """
     Tracked unit of work with scope, status, authority, dependencies and outcome.
+
+    Enforces Section 2 invariants:
+    - Stable ID
+    - Recorded transitions with actor + reason + timestamp
+    - Invalid transitions are rejected
     """
 
     task_id: str
@@ -69,16 +145,21 @@ class Task:
     created_by: str = "system"
     assigned_component: Optional[str] = None
     parent_task_id: Optional[str] = None
-    dependencies: tuple[str, ...] = ()          # other task_ids that must complete first
-    required_permissions: tuple[str, ...] = ()  # action names that need grants/approvals
+    dependencies: tuple[str, ...] = ()
+    required_permissions: tuple[str, ...] = ()
     approval_category: Optional[str] = None
-    authority_status: str = "none"              # recommendation / delegated / approval_required / granted
+    authority_status: str = "none"
     environment: str = "development"
     payload: dict = field(default_factory=dict)
     result: Optional[dict] = None
     error: Optional[str] = None
     transitions: list[TaskTransition] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+
+    def can_transition_to(self, to_status: TaskStatus) -> bool:
+        """Return True if the transition is allowed."""
+        allowed = ALLOWED_TRANSITIONS.get(self.status, set())
+        return to_status in allowed
 
     def transition(
         self,
@@ -87,8 +168,23 @@ class Task:
         reason: str = "",
         references: Optional[dict] = None,
     ) -> None:
-        """Record a status change with full audit information."""
+        """
+        Record a status change with full audit information.
+
+        Raises ValueError if the transition is not allowed.
+        This enforces the "No hidden transition" invariant.
+        """
+        if not actor:
+            raise ValueError("Transition actor is required.")
+
+        if not self.can_transition_to(to_status):
+            raise ValueError(
+                f"Invalid transition: {self.status.value} → {to_status.value} "
+                f"is not allowed for task {self.task_id}."
+            )
+
         now = datetime.now(timezone.utc)
+
         self.transitions.append(
             TaskTransition(
                 from_status=self.status,
@@ -99,16 +195,22 @@ class Task:
                 references=references or {},
             )
         )
+
         self.status = to_status
         self.updated_at = now
 
     def is_terminal(self) -> bool:
+        """Return True if the task is in a final state."""
         return self.status in {
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
             TaskStatus.REJECTED,
         }
+
+    def is_active(self) -> bool:
+        """Return True if the task can still make progress."""
+        return not self.is_terminal()
 
 
 @dataclass
@@ -151,4 +253,4 @@ def create_task(
         environment=environment,
         payload=payload or {},
         parent_task_id=parent_task_id,
-    )
+)
