@@ -3,6 +3,11 @@ BAIG MASTER — Coordination & Operations Core
 
 Implements the responsibilities defined in the Central System specification §7.
 MASTER organizes work; it does not decide truth.
+
+This version respects Section 2 principles:
+- No hidden transitions
+- Clear recording of actor and reason
+- Safe handling of invalid transitions
 """
 
 from __future__ import annotations
@@ -145,11 +150,22 @@ class Master:
         actor: str,
         reason: str = "",
     ) -> Optional[Task]:
+        """
+        Attempt to change a task's status.
+        Invalid transitions are rejected and logged as a failed attempt.
+        """
         task = self._tasks.get(task_id)
         if task is None:
             return None
-        task.transition(to_status, actor=actor, reason=reason)
-        return task
+
+        try:
+            task.transition(to_status, actor=actor, reason=reason)
+            return task
+        except ValueError as e:
+            # Invalid transition — do not change state
+            # In a full system this would also be written to the audit log
+            print(f"[MASTER] Transition rejected: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Authorization gate (the critical safety path)
@@ -161,22 +177,31 @@ class Master:
             return AuthorizationDecision(
                 allowed=False,
                 reason=f"Task {task_id} not found",
+                actor=actor,
+                action=action,
             )
         return self.execution_control.authorize(task, actor, action)
 
     def try_make_ready(self, task_id: str, actor: str = "master") -> AuthorizationDecision:
         """
         Attempt to move a task to READY after checking dependencies and authority.
+        Respects Section 2 principles (no hidden transitions, clear reasons).
         """
         task = self._tasks.get(task_id)
         if task is None:
-            return AuthorizationDecision(allowed=False, reason="Task not found")
+            return AuthorizationDecision(
+                allowed=False,
+                reason="Task not found",
+                actor=actor,
+                action="try_make_ready",
+            )
 
         # Dependency check
         for dep_id in task.dependencies:
             dep = self._tasks.get(dep_id)
             if dep is None or dep.status != TaskStatus.COMPLETED:
-                task.transition(
+                self.transition_task(
+                    task_id,
                     TaskStatus.BLOCKED,
                     actor=actor,
                     reason=f"Waiting for dependency {dep_id}",
@@ -184,26 +209,48 @@ class Master:
                 return AuthorizationDecision(
                     allowed=False,
                     reason=f"Dependency {dep_id} not completed",
+                    actor=actor,
+                    action="try_make_ready",
+                    scope=task_id,
                 )
 
         # Authority check
         decision = self.execution_control.check_task_ready(task, actor=actor)
+
         if not decision.allowed:
             if decision.required_approval:
-                task.transition(
+                self.transition_task(
+                    task_id,
                     TaskStatus.AWAITING_APPROVAL,
                     actor=actor,
                     reason=decision.reason,
                 )
             else:
-                task.transition(
+                self.transition_task(
+                    task_id,
                     TaskStatus.BLOCKED,
                     actor=actor,
                     reason=decision.reason,
                 )
             return decision
 
-        task.transition(TaskStatus.READY, actor=actor, reason="All checks passed")
+        # All checks passed
+        success = self.transition_task(
+            task_id,
+            TaskStatus.READY,
+            actor=actor,
+            reason="All checks passed",
+        )
+
+        if success is None:
+            return AuthorizationDecision(
+                allowed=False,
+                reason="Failed to transition task to READY (invalid transition)",
+                actor=actor,
+                action="try_make_ready",
+                scope=task_id,
+            )
+
         return decision
 
     # ------------------------------------------------------------------
