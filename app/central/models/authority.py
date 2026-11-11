@@ -76,6 +76,18 @@ class PermissionGrant:
             return False
         return True
 
+    def covers(self, action: str, scope: str) -> bool:
+        """
+        Check whether this grant covers the requested action and scope.
+        A grant with scope='*' covers any scope.
+        A grant with a specific scope only covers that exact scope.
+        """
+        if not self.is_valid():
+            return False
+        action_ok = self.action == action or self.action == "*"
+        scope_ok = self.scope == scope or self.scope == "*"
+        return action_ok and scope_ok
+
 
 @dataclass(frozen=True)
 class ApprovalRecord:
@@ -111,6 +123,18 @@ class ApprovalRecord:
             return False
         return True
 
+    def covers(self, action: str, scope: str, category: str) -> bool:
+        """
+        Check whether this approval covers the exact requested action, scope and category.
+        """
+        if not self.is_valid():
+            return False
+        return (
+            self.action == action
+            and self.scope == scope
+            and self.category == category
+        )
+
 
 @dataclass
 class AuthorityContext:
@@ -124,22 +148,22 @@ class AuthorityContext:
     approvals: tuple[ApprovalRecord, ...] = ()
     environment: str = "development"
 
-    def has_valid_grant(self, action: str, scope: str = "*") -> bool:
+    def has_valid_grant(self, action: str, scope: str) -> bool:
+        """
+        Return True only if a grant specifically covers the action and scope.
+        No automatic wildcard expansion from the caller.
+        """
         for grant in self.grants:
-            if not grant.is_valid():
-                continue
-            if grant.action == action or grant.action == "*":
-                if scope == "*" or grant.scope == scope or grant.scope == "*":
-                    return True
+            if grant.covers(action=action, scope=scope):
+                return True
         return False
 
-    def has_valid_approval(self, action: str, category: str) -> bool:
+    def has_valid_approval(self, action: str, scope: str, category: str) -> bool:
+        """
+        Return True only if an approval exactly covers the action, scope and category.
+        """
         for approval in self.approvals:
-            if (
-                approval.is_valid()
-                and approval.action == action
-                and approval.category == category
-            ):
+            if approval.covers(action=action, scope=scope, category=category):
                 return True
         return False
 
