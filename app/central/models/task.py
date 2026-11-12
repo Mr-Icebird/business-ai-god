@@ -1,12 +1,12 @@
 """
 BAIG Central System — Task and Workflow models.
 
-Implements the task lifecycle described in the Central System specification
-(Sections 7, 10 and 15) with stronger enforcement of Section 2 invariants:
+Implements the task lifecycle with stronger enforcement of
+Section 2 and Final Specification invariants:
 
-- No hidden transitions
+- No hidden / invalid transitions
 - Every state change records actor, reason, time, previous and new state
-- Invalid transitions are rejected
+- RECEIVED can move to BLOCKED or AWAITING_APPROVAL (lifecycle fix)
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from app.central.models.authority import new_id
 
 
 class TaskStatus(str, Enum):
-    """Task lifecycle states aligned with the specification."""
+    """Task lifecycle states aligned with the Final Specification."""
 
     RECEIVED = "received"
     VALIDATING = "validating"
@@ -45,10 +45,12 @@ class TaskPriority(str, Enum):
 
 
 # Allowed transitions (from_status → set of allowed to_status)
-# This enforces "No hidden / invalid transitions"
+# Fixed to support proper dependency and authorization gating
 ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.RECEIVED: {
         TaskStatus.VALIDATING,
+        TaskStatus.BLOCKED,              # Fixed: needed for dependency checks
+        TaskStatus.AWAITING_APPROVAL,    # Fixed: needed for early authority checks
         TaskStatus.REJECTED,
         TaskStatus.CANCELLED,
     },
@@ -90,6 +92,7 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
         TaskStatus.AWAITING_APPROVAL,
         TaskStatus.CANCELLED,
         TaskStatus.FAILED,
+        TaskStatus.VALIDATING,           # Allow re-validation after unblock
     },
     TaskStatus.PAUSED: {
         TaskStatus.READY,
@@ -128,7 +131,7 @@ class Task:
     """
     Tracked unit of work with scope, status, authority, dependencies and outcome.
 
-    Enforces Section 2 invariants:
+    Enforces:
     - Stable ID
     - Recorded transitions with actor + reason + timestamp
     - Invalid transitions are rejected
@@ -191,7 +194,7 @@ class Task:
                 to_status=to_status,
                 at=now,
                 actor=actor,
-                reason=reason,
+                reason=reason or "No reason provided",
                 references=references or {},
             )
         )
@@ -253,4 +256,4 @@ def create_task(
         environment=environment,
         payload=payload or {},
         parent_task_id=parent_task_id,
-)
+    )
