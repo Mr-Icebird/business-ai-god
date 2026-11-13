@@ -1,26 +1,29 @@
 """
-BAIG MASTER — Coordinated with corrected Execution Control
+BAIG MASTER — Thin coordinator
 
-Consumes:
-- AuthorizationOutcome + reason_code from execution_control
-- Individual decisions from the decision log for durable audit
+Uses:
+- Execution Control for authorization decisions
+- Audit Ledger for durable records
+- Dependency subsystem for validation + ordered locking
 
-Rules:
-- Every individual authorization decision is durably audited
-- Audit failure blocks consequential authorization / transitions
-- Per-task locking around readiness + transitions
-- Callers receive copies, not live mutable objects
+MASTER coordinates. It does not decide factual truth.
 """
 
 from __future__ import annotations
 
-import threading
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 from app.central.audit.ledger import AUDIT_LEDGER, AuditWriteError
+from app.central.master.dependency import (
+    DependencyValidationError,
+    TaskLockManager,
+    validate_basic,
+    validate_no_cycle,
+    validate_references,
+)
 from app.central.master.execution_control import (
     AuthorizationDecision,
     AuthorizationOutcome,
@@ -67,23 +70,22 @@ class ComponentInfo:
 
 
 class Master:
-    def __init__(self):
+    def __init__(self) -> None:
         self._execution_control = ExecutionControlManager()
+        self._lock_manager = TaskLockManager()
         self._tasks: dict[str, Task] = {}
         self._components: dict[str, ComponentInfo] = {}
-        self._task_locks: dict[str, threading.RLock] = {}
-        self._locks_guard = threading.Lock()
         self._register_core_components()
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_task_lock(self, task_id: str) -> threading.RLock:
-        with self._locks_guard:
-            if task_id not in self._task_locks:
-                self._task_locks[task_id] = threading.RLock()
-            return self._task_locks[task_id]
+    def _dependency_graph(self) -> dict[str, tuple[str, ...]]:
+        return {
+            task_id: tuple(task.dependencies)
+            for task_id, task in self._tasks.items()
+        }
 
     def _audit_authorization_decision(
         self,
@@ -91,10 +93,6 @@ class Master:
         *,
         task: Optional[Task] = None,
     ) -> bool:
-        """
-        Persist one authorization decision.
-        Returns True on success, False on audit failure.
-        """
         try:
             AUDIT_LEDGER.record_authorization(
                 actor=decision.actor or "unknown",
@@ -130,10 +128,6 @@ class Master:
         start_index: int,
         task: Task,
     ) -> bool:
-        """
-        Durably audit every decision appended since start_index.
-        If any write fails, return False (fail closed).
-        """
         log = self._execution_control.get_decision_log()
         for decision in log[start_index:]:
             if not self._audit_authorization_decision(decision, task=task):
@@ -207,19 +201,6 @@ class Master:
     # Tasks
     # ------------------------------------------------------------------
 
-    def _validate_dependencies(
-        self,
-        task_id: str,
-        dependencies: tuple[str, ...],
-        parent_task_id: Optional[str],
-    ) -> None:
-        if task_id in dependencies:
-            raise ValueError("Task cannot depend on itself")
-        if parent_task_id is not None and parent_task_id == task_id:
-            raise ValueError("Task cannot be its own parent")
-        if len(dependencies) != len(set(dependencies)):
-            raise ValueError("Duplicate dependencies are not allowed")
-
     def create_task(
         self,
         title: str,
@@ -234,6 +215,7 @@ class Master:
         payload: Optional[dict] = None,
         parent_task_id: Optional[str] = None,
         dependencies: tuple[str, ...] = (),
+        allow_forward_refs: bool = True,
     ) -> Task:
         task = create_task(
             title=title,
@@ -248,7 +230,20 @@ class Master:
             parent_task_id=parent_task_id,
         )
         task.dependencies = dependencies
-        self._validate_dependencies(task.task_id, dependencies, parent_task_id)
+
+        # Dependency subsystem validation
+        validate_basic(task.task_id, dependencies, parent_task_id)
+        validate_references(
+            task.task_id,
+            dependencies,
+            self._tasks,
+            allow_forward_refs=allow_forward_refs,
+        )
+        validate_no_cycle(
+            task.task_id,
+            dependencies,
+            self._dependency_graph(),
+        )
 
         try:
             AUDIT_LEDGER.record(
@@ -293,8 +288,7 @@ class Master:
         if not actor or not str(actor).strip():
             raise ValueError("actor is required for task transitions")
 
-        lock = self._get_task_lock(task_id)
-        with lock:
+        with self._lock_manager.acquire([task_id]):
             task = self._tasks.get(task_id)
             if task is None:
                 return None
@@ -307,6 +301,7 @@ class Master:
         actor: str,
         reason: str = "",
     ) -> Optional[Task]:
+        """Assumes caller already holds the needed locks."""
         from_status = task.status
 
         if not task.can_transition_to(to_status):
@@ -376,7 +371,6 @@ class Master:
         before = len(self._execution_control.get_decision_log())
         decision = self._execution_control.authorize(task, actor, action)
 
-        # Audit every decision produced by this call (usually one)
         if not self._audit_recent_decisions_since(before, task):
             return AuthorizationDecision(
                 allowed=False,
@@ -404,8 +398,14 @@ class Master:
                 reason_code="MISSING_ACTOR",
             )
 
-        lock = self._get_task_lock(task_id)
-        with lock:
+        # Lock the task and all its current dependencies together
+        # (ordered acquisition prevents deadlock)
+        task_preview = self._tasks.get(task_id)
+        lock_ids = [task_id]
+        if task_preview is not None:
+            lock_ids.extend(task_preview.dependencies)
+
+        with self._lock_manager.acquire(lock_ids):
             task = self._tasks.get(task_id)
             if task is None:
                 return AuthorizationDecision(
@@ -417,7 +417,7 @@ class Master:
                     reason_code="TASK_NOT_FOUND",
                 )
 
-            # Dependencies
+            # Re-check dependencies under the same locks
             for dep_id in task.dependencies:
                 dep = self._tasks.get(dep_id)
                 if dep is None or dep.status != TaskStatus.COMPLETED:
@@ -437,11 +437,9 @@ class Master:
                         reason_code="DEPENDENCY_NOT_READY",
                     )
 
-            # Full readiness authorization (produces individual decisions)
             before = len(self._execution_control.get_decision_log())
             decision = self._execution_control.check_task_ready(task, actor=actor)
 
-            # Durably audit EVERY individual decision produced
             if not self._audit_recent_decisions_since(before, task):
                 return AuthorizationDecision(
                     allowed=False,
