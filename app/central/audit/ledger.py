@@ -1,3 +1,4 @@
+
 """
 BAIG Central System — Audit Ledger (Phase 1.4)
 
@@ -73,13 +74,8 @@ VALID_EVENT_TYPES = frozenset({
     "audit.access",
 })
 
-REASON_CODE_PATTERN = re.compile(
-    r"^[A-Z][A-Z0-9_]{0,63}$"
-)
-
-GENERAL_CODE_PATTERN = re.compile(
-    r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$"
-)
+REASON_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+GENERAL_CODE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +104,6 @@ def _require_string(
     *,
     optional: bool = False,
 ) -> Optional[str]:
-
     if value is None and optional:
         return None
 
@@ -127,19 +122,14 @@ def _normalize_datetime(
     value: Optional[datetime],
     field_name: str,
 ) -> Optional[datetime]:
-
     if value is None:
         return None
 
     if not isinstance(value, datetime):
-        raise ValueError(
-            f"{field_name} must be a datetime or None"
-        )
+        raise ValueError(f"{field_name} must be a datetime or None")
 
     if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError(
-            f"{field_name} must be timezone-aware"
-        )
+        raise ValueError(f"{field_name} must be timezone-aware")
 
     return value.astimezone(timezone.utc)
 
@@ -150,14 +140,11 @@ def _validate_string_sequence(
     *,
     code_pattern: Optional[re.Pattern] = None,
 ) -> tuple[str, ...]:
-
     if values is None:
         return ()
 
     if not isinstance(values, (tuple, list)):
-        raise ValueError(
-            f"{field_name} must be a tuple or list"
-        )
+        raise ValueError(f"{field_name} must be a tuple or list")
 
     result = []
 
@@ -199,7 +186,6 @@ def _json_safe(value: Any) -> Any:
 
     Unsupported objects and non-finite floats are rejected.
     """
-
     if value is None or isinstance(value, (str, bool, int)):
         return value
 
@@ -222,9 +208,7 @@ def _json_safe(value: Any) -> Any:
 
         for key, item in value.items():
             if not isinstance(key, str):
-                raise ValueError(
-                    "JSON object keys must be strings"
-                )
+                raise ValueError("JSON object keys must be strings")
 
             result[key] = _json_safe(item)
 
@@ -244,6 +228,8 @@ def _json_safe(value: Any) -> Any:
 
 SENSITIVE_KEYS = (
     "password",
+    "passwd",
+    "pwd",
     "token",
     "secret",
     "api_key",
@@ -255,26 +241,51 @@ SENSITIVE_KEYS = (
     "credential",
     "credentials",
     "client_secret",
+    "signing_key",
 )
 
+# Redact sensitive values in free text, not only dictionary values.
 TEXT_SECRET_PATTERNS = (
+    # Authorization bearer credentials.
     re.compile(
         r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"
     ),
+
+    # Common credential assignments:
+    # token=..., password:..., api_key=..., etc.
     re.compile(
-        r"(?i)\b(password|passwd|api[_-]?key|"
-        r"access[_-]?token|refresh[_-]?token|"
-        r"client[_-]?secret)\s*[:=]\s*"
-        r"[^\s,;]+"
+        r"""(?ix)
+        \b(
+            password|passwd|pwd|
+            token|access[_-]?token|refresh[_-]?token|
+            id[_-]?token|auth[_-]?token|
+            secret|client[_-]?secret|
+            api[_-]?key|apikey|
+            authorization|
+            private[_-]?key|signing[_-]?key|
+            credential|credentials
+        )
+        \s*([=:])\s*
+        ("[^"]*"|'[^']*'|[^\s,;&]+)
+        """
+    ),
+
+    # PEM private-key blocks.
+    re.compile(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+        r".*?"
+        r"-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        re.DOTALL,
     ),
 )
 
 
 def _is_sensitive_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
 
     return any(
-        sensitive in normalized
+        re.sub(r"[^a-z0-9]", "", sensitive.lower())
+        in normalized
         for sensitive in SENSITIVE_KEYS
     )
 
@@ -283,16 +294,21 @@ def _sanitize_text(value: str) -> str:
     result = value
 
     for pattern in TEXT_SECRET_PATTERNS:
-        result = pattern.sub(
-            "[REDACTED]",
-            result,
-        )
+        if pattern.groups == 3:
+            result = pattern.sub(
+                lambda match: (
+                    f"{match.group(1)}"
+                    f"{match.group(2)}[REDACTED]"
+                ),
+                result,
+            )
+        else:
+            result = pattern.sub("[REDACTED]", result)
 
     return result
 
 
 def _sanitize_value(value: Any) -> Any:
-
     if isinstance(value, dict):
         result = {}
 
@@ -325,7 +341,6 @@ def _sanitize_mapping(
     value: Optional[dict],
     field_name: str,
 ) -> dict:
-
     if value is None:
         return {}
 
@@ -336,7 +351,6 @@ def _sanitize_mapping(
 
     sanitized = _sanitize_value(value)
 
-    # Also verify that the resulting data is JSON-compatible.
     return _json_safe(sanitized)
 
 
@@ -363,7 +377,10 @@ class FileLock:
         file_obj,
         timeout: float = 5.0,
     ):
-        if not isinstance(timeout, (int, float)):
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+        ):
             raise ValueError("timeout must be numeric")
 
         if not math.isfinite(timeout) or timeout < 0:
@@ -377,10 +394,8 @@ class FileLock:
 
     @staticmethod
     def _is_lock_conflict(error: OSError) -> bool:
-
         if sys.platform == "win32":
-            # Windows ERROR_LOCK_VIOLATION.
-            return getattr(error, "winerror", None) == 33
+            return getattr(error, "winerror", None) in {32, 33}
 
         return error.errno in {
             errno.EACCES,
@@ -389,7 +404,6 @@ class FileLock:
         }
 
     def acquire(self) -> None:
-
         start = time.monotonic()
 
         while True:
@@ -404,7 +418,6 @@ class FileLock:
                         msvcrt.LK_NBLCK,
                         1,
                     )
-
                 else:
                     import fcntl
 
@@ -417,7 +430,6 @@ class FileLock:
                 return
 
             except OSError as error:
-
                 if not self._is_lock_conflict(error):
                     raise
 
@@ -429,12 +441,9 @@ class FileLock:
                         f"within {self.timeout} seconds"
                     ) from error
 
-                time.sleep(
-                    min(0.05, self.timeout - elapsed)
-                )
+                time.sleep(min(0.05, self.timeout - elapsed))
 
     def release(self) -> None:
-
         if not self._locked:
             return
 
@@ -449,7 +458,6 @@ class FileLock:
                     msvcrt.LK_UNLCK,
                     1,
                 )
-
             else:
                 import fcntl
 
@@ -457,7 +465,6 @@ class FileLock:
                     self.file_obj.fileno(),
                     fcntl.LOCK_UN,
                 )
-
         finally:
             self._locked = False
 
@@ -476,7 +483,6 @@ class FileLock:
 
 @dataclass
 class AuditEvent:
-
     event_id: str
     event_type: str
     actor: str
@@ -533,7 +539,13 @@ class AuditEvent:
     schema_version: str = SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
+        """
+        Convert the complete event to JSON-compatible data.
 
+        IMPORTANT:
+        Sanitization is applied to the entire event, including
+        actor, action, IDs, environment, reason and nested details.
+        """
         data = asdict(self)
 
         data["timestamp"] = _normalize_datetime(
@@ -559,19 +571,12 @@ class AuditEvent:
             else None
         )
 
-        data["risk_categories"] = list(
-            self.risk_categories
-        )
+        data["risk_categories"] = list(self.risk_categories)
+        data["unmet_conditions"] = list(self.unmet_conditions)
+        data["reason_codes"] = list(self.reason_codes)
 
-        data["unmet_conditions"] = list(
-            self.unmet_conditions
-        )
-
-        data["reason_codes"] = list(
-            self.reason_codes
-        )
-
-        return _json_safe(data)
+        # Sanitize every field before it can be serialized.
+        return _json_safe(_sanitize_value(data))
 
 
 # ---------------------------------------------------------------------------
@@ -585,16 +590,14 @@ class AuditLedger:
         path: str | Path = "logs/baig_audit.jsonl",
         lock_timeout: float = 5.0,
     ):
-
         self.path = Path(path)
-        self.lock_path = Path(
-            str(self.path) + ".lock"
-        )
+        self.lock_path = Path(str(self.path) + ".lock")
 
-        if not isinstance(lock_timeout, (int, float)):
-            raise ValueError(
-                "lock_timeout must be numeric"
-            )
+        if (
+            isinstance(lock_timeout, bool)
+            or not isinstance(lock_timeout, (int, float))
+        ):
+            raise ValueError("lock_timeout must be numeric")
 
         if (
             not math.isfinite(lock_timeout)
@@ -665,41 +668,28 @@ class AuditLedger:
         environment: str = "development",
     ) -> AuditEvent:
 
-        # Normalize required strings first.
-        event_type = _require_string(
-            event_type,
-            "event_type",
-        )
-
-        actor = _require_string(
-            actor,
-            "actor",
-        )
-
-        action = _require_string(
-            action,
-            "action",
-        )
+        event_type = _require_string(event_type, "event_type")
+        actor = _require_string(actor, "actor")
+        action = _require_string(action, "action")
+        outcome = _require_string(outcome, "outcome")
 
         if event_type not in VALID_EVENT_TYPES:
-            raise ValueError(
-                f"Unknown event_type: {event_type}"
-            )
+            raise ValueError(f"Unknown event_type: {event_type}")
 
         if outcome not in VALID_EVENT_OUTCOMES:
-            raise ValueError(
-                f"Invalid outcome: {outcome}"
+            raise ValueError(f"Invalid outcome: {outcome}")
+
+        if auth_outcome is not None:
+            auth_outcome = _require_string(
+                auth_outcome,
+                "auth_outcome",
             )
 
-        if (
-            auth_outcome is not None
-            and auth_outcome not in VALID_AUTH_OUTCOMES
-        ):
-            raise ValueError(
-                f"Invalid auth_outcome: {auth_outcome}"
-            )
+            if auth_outcome not in VALID_AUTH_OUTCOMES:
+                raise ValueError(
+                    f"Invalid auth_outcome: {auth_outcome}"
+                )
 
-        # Validate optional string fields.
         optional_string_fields = {
             "target_type": target_type,
             "target_id": target_id,
@@ -735,18 +725,16 @@ class AuditLedger:
                 "target_type is required when target_id is supplied"
             )
 
-        # Validate reason and environment.
         if not isinstance(reason, str):
             raise ValueError("reason must be a string")
 
-        reason = _sanitize_text(reason.strip())
+        reason = reason.strip()
 
         environment = _require_string(
             environment,
             "environment",
         )
 
-        # Validate datetime fields.
         valid_from = _normalize_datetime(
             valid_from,
             "valid_from",
@@ -766,7 +754,6 @@ class AuditLedger:
                 "valid_from must be earlier than expires_at"
             )
 
-        # Validate sequences.
         risk_categories = _validate_string_sequence(
             risk_categories,
             "risk_categories",
@@ -784,18 +771,13 @@ class AuditLedger:
             code_pattern=REASON_CODE_PATTERN,
         )
 
-        # Validate and sanitize dictionaries.
-        safe_details = _sanitize_mapping(
-            details,
-            "details",
-        )
-
+        safe_details = _sanitize_mapping(details, "details")
         safe_limits = _sanitize_mapping(
             applied_limits,
             "applied_limits",
         )
 
-        event = AuditEvent(
+        event = AuditEven(
             event_id=_new_event_id(),
             event_type=event_type,
             actor=actor,
@@ -818,7 +800,10 @@ class AuditLedger:
             new_state=normalized_fields["new_state"],
 
             grant_id=normalized_fields["grant_id"],
-            approval_id=normalinormalized_fields["approval_id"],
+
+            # Corrected variable name:
+            approval_id=normalized_fields["approval_id"],
+
             decision_id=normalized_fields["decision_id"],
 
             auth_outcome=auth_outcome,
@@ -942,6 +927,11 @@ class AuditLedger:
         details: Optional[dict] = None,
     ) -> AuditEvent:
 
+        auth_outcome = _require_string(
+            auth_outcome,
+            "auth_outcome",
+        )
+
         if auth_outcome not in VALID_AUTH_OUTCOMES:
             raise ValueError(
                 f"Invalid auth_outcome: {auth_outcome}"
@@ -1008,9 +998,7 @@ class AuditLedger:
     # ------------------------------------------------------------------
 
     def _append(self, event: AuditEvent) -> None:
-
         try:
-            # Serialization is inside the error-handling boundary.
             line = (
                 json.dumps(
                     event.to_dict(),
@@ -1020,8 +1008,6 @@ class AuditLedger:
                 + "\n"
             )
 
-            # Use a separate lock file so the audit data remains
-            # a clean JSONL file on both Windows and Unix.
             with self.lock_path.open("a+b") as lock_file:
 
                 # Ensure byte zero exists for Windows byte-range locking.
