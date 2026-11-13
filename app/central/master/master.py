@@ -1,11 +1,15 @@
 """
-BAIG MASTER — Focused safety correction
+BAIG MASTER — Coordinated with corrected Execution Control
 
-Addresses the four critical remaining defects:
-1. Individual authorization decisions during readiness are durably audited
-2. Direct access to execution_control is closed
-3. Full readiness path is covered by per-task locking
-4. Successful transition audits are only written after all preconditions pass
+Consumes:
+- AuthorizationOutcome + reason_code from execution_control
+- Individual decisions from the decision log for durable audit
+
+Rules:
+- Every individual authorization decision is durably audited
+- Audit failure blocks consequential authorization / transitions
+- Per-task locking around readiness + transitions
+- Callers receive copies, not live mutable objects
 """
 
 from __future__ import annotations
@@ -17,7 +21,11 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from app.central.audit.ledger import AUDIT_LEDGER, AuditWriteError
-from app.central.master.execution_control import AuthorizationDecision, ExecutionControlManager
+from app.central.master.execution_control import (
+    AuthorizationDecision,
+    AuthorizationOutcome,
+    ExecutionControlManager,
+)
 from app.central.models.task import (
     Task,
     TaskPriority,
@@ -60,7 +68,6 @@ class ComponentInfo:
 
 class Master:
     def __init__(self):
-        # Private — callers must not reach this directly
         self._execution_control = ExecutionControlManager()
         self._tasks: dict[str, Task] = {}
         self._components: dict[str, ComponentInfo] = {}
@@ -69,7 +76,7 @@ class Master:
         self._register_core_components()
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Helpers
     # ------------------------------------------------------------------
 
     def _get_task_lock(self, task_id: str) -> threading.RLock:
@@ -78,58 +85,63 @@ class Master:
                 self._task_locks[task_id] = threading.RLock()
             return self._task_locks[task_id]
 
-    def _map_auth_outcome(self, decision: AuthorizationDecision) -> str:
-        """
-        Prefer explicit reason codes when available.
-        Do not treat a missing grant as merely an outstanding approval.
-        """
-        reason = (decision.reason or "").lower()
-        required_approval = bool(getattr(decision, "required_approval", False))
-
-        if decision.allowed:
-            return "ALLOW"
-
-        # Missing grant / permission should be DENY, not REQUIRE_APPROVAL
-        if any(token in reason for token in ("grant", "permission", "not permitted", "unauthorized")):
-            return "DENY"
-
-        if required_approval:
-            return "REQUIRE_APPROVAL"
-
-        return "DENY"
-
-    def _record_authorization_decision(
+    def _audit_authorization_decision(
         self,
         decision: AuthorizationDecision,
         *,
-        task: Optional[Task],
-        actor: str,
-        action: str,
+        task: Optional[Task] = None,
     ) -> bool:
         """
-        Write one durable authorization record.
+        Persist one authorization decision.
         Returns True on success, False on audit failure.
         """
-        auth_outcome = self._map_auth_outcome(decision)
         try:
             AUDIT_LEDGER.record_authorization(
-                actor=actor,
-                action=action,
-                auth_outcome=auth_outcome,
+                actor=decision.actor or "unknown",
+                action=decision.action or "unknown",
+                auth_outcome=decision.outcome.value,
                 reason=decision.reason or "",
-                task_id=getattr(task, "task_id", None) if task else getattr(decision, "scope", None),
+                task_id=(
+                    task.task_id if task is not None
+                    else (decision.scope or None)
+                ),
                 correlation_id=getattr(task, "correlation_id", None) if task else None,
-                environment=getattr(task, "environment", "development") if task else "development",
-                decision_id=getattr(decision, "decision_id", None),
-                grant_id=getattr(decision, "grant_id", None),
-                approval_id=getattr(decision, "approval_id", None),
+                environment=(
+                    task.environment if task is not None
+                    else (decision.environment or "development")
+                ),
+                decision_id=decision.decision_id,
+                grant_id=decision.grant_id,
+                approval_id=decision.approval_id,
+                details={
+                    "reason_code": decision.reason_code,
+                    "approval_category": decision.approval_category,
+                    "required_approval": decision.required_approval,
+                    "scope": decision.scope,
+                    "checked_at": decision.checked_at.isoformat(),
+                },
             )
             return True
         except AuditWriteError:
             return False
 
+    def _audit_recent_decisions_since(
+        self,
+        start_index: int,
+        task: Task,
+    ) -> bool:
+        """
+        Durably audit every decision appended since start_index.
+        If any write fails, return False (fail closed).
+        """
+        log = self._execution_control.get_decision_log()
+        for decision in log[start_index:]:
+            if not self._audit_authorization_decision(decision, task=task):
+                return False
+        return True
+
     # ------------------------------------------------------------------
-    # Component registry
+    # Components
     # ------------------------------------------------------------------
 
     def _register_core_components(self) -> None:
@@ -192,7 +204,7 @@ class Master:
         return True
 
     # ------------------------------------------------------------------
-    # Task management
+    # Tasks
     # ------------------------------------------------------------------
 
     def _validate_dependencies(
@@ -286,181 +298,7 @@ class Master:
             task = self._tasks.get(task_id)
             if task is None:
                 return None
-
-            from_status = task.status
-
-            # Validate ALL preconditions before writing a success audit
-            if not task.can_transition_to(to_status):
-                try:
-                    AUDIT_LEDGER.record(
-                        event_type="task.transition",
-                        actor=actor,
-                        action="transition",
-                        outcome="rejected",
-                        target_type="task",
-                        target_id=task_id,
-                        task_id=task_id,
-                        correlation_id=task.correlation_id,
-                        old_state=from_status.value,
-                        new_state=to_status.value,
-                        reason=reason or "Invalid transition rejected",
-                        environment=task.environment,
-                    )
-                except AuditWriteError:
-                    pass
-                return None
-
-            # All preconditions passed — now record success and mutate
-            try:
-                AUDIT_LEDGER.record_transition(
-                    actor=actor,
-                    task_id=task_id,
-                    from_status=from_status.value,
-                    to_status=to_status.value,
-                    reason=reason or "No reason provided",
-                    correlation_id=task.correlation_id,
-                    outcome="success",
-                    environment=task.environment,
-                )
-            except AuditWriteError:
-                return None
-
-            try:
-                task.transition(to_status, actor=actor, reason=reason)
-            except ValueError:
-                # Should be rare after the checks above; state unchanged
-                return None
-
-            return deepcopy(task)
-
-    # ------------------------------------------------------------------
-    # Authorization gateway (mandatory route)
-    # ------------------------------------------------------------------
-
-    def authorize_task(self, task_id: str, actor: str, action: str) -> AuthorizationDecision:
-        """
-        Mandatory audited authorization gateway.
-        Callers must use this method, not the private execution control manager.
-        """
-        task = self._tasks.get(task_id)
-
-        if task is None:
-            decision = AuthorizationDecision(
-                allowed=False,
-                reason=f"Task {task_id} not found",
-                actor=actor,
-                action=action,
-            )
-            self._record_authorization_decision(
-                decision, task=None, actor=actor, action=action
-            )
-            return decision
-
-        decision = self._execution_control.authorize(task, actor, action)
-
-        if not self._record_authorization_decision(
-            decision, task=task, actor=actor, action=action
-        ):
-            return AuthorizationDecision(
-                allowed=False,
-                reason="Authorization audit write failed; operation blocked",
-                actor=actor,
-                action=action,
-                scope=task_id,
-            )
-
-        return decision
-
-    def try_make_ready(self, task_id: str, actor: str = "master") -> AuthorizationDecision:
-        """
-        Full readiness path under per-task lock:
-        - dependency check
-        - full check_task_ready()
-        - durable audit of the readiness decision
-        - audited state transition
-        """
-        if not actor or not str(actor).strip():
-            return AuthorizationDecision(
-                allowed=False,
-                reason="actor is required",
-                actor=actor or "unknown",
-                action="try_make_ready",
-            )
-
-        lock = self._get_task_lock(task_id)
-        with lock:
-            task = self._tasks.get(task_id)
-            if task is None:
-                return AuthorizationDecision(
-                    allowed=False,
-                    reason="Task not found",
-                    actor=actor,
-                    action="try_make_ready",
-                )
-
-            # Dependency check (under the same lock)
-            for dep_id in task.dependencies:
-                dep = self._tasks.get(dep_id)
-                if dep is None or dep.status != TaskStatus.COMPLETED:
-                    # Transition while still holding the lock
-                    self._transition_locked(
-                        task,
-                        TaskStatus.BLOCKED,
-                        actor=actor,
-                        reason=f"Waiting for dependency {dep_id}",
-                    )
-                    return AuthorizationDecision(
-                        allowed=False,
-                        reason=f"Dependency {dep_id} not completed",
-                        actor=actor,
-                        action="try_make_ready",
-                        scope=task_id,
-                    )
-
-            # Full readiness authorization
-            decision = self._execution_control.check_task_ready(task, actor=actor)
-
-            # Durably record the readiness decision
-            if not self._record_authorization_decision(
-                decision, task=task, actor=actor, action="make_ready"
-            ):
-                return AuthorizationDecision(
-                    allowed=False,
-                    reason="Readiness authorization audit write failed; operation blocked",
-                    actor=actor,
-                    action="try_make_ready",
-                    scope=task_id,
-                )
-
-            if not decision.allowed:
-                target = (
-                    TaskStatus.AWAITING_APPROVAL
-                    if getattr(decision, "required_approval", False)
-                    else TaskStatus.BLOCKED
-                )
-                self._transition_locked(
-                    task,
-                    target,
-                    actor=actor,
-                    reason=decision.reason or "Authorization denied",
-                )
-                return decision
-
-            success = self._transition_locked(
-                task,
-                TaskStatus.READY,
-                actor=actor,
-                reason="All checks passed",
-            )
-            if success is None:
-                return AuthorizationDecision(
-                    allowed=False,
-                    reason="Failed to transition task to READY",
-                    actor=actor,
-                    action="try_make_ready",
-                    scope=task_id,
-                )
-            return decision
+            return self._transition_locked(task, to_status, actor, reason)
 
     def _transition_locked(
         self,
@@ -469,10 +307,6 @@ class Master:
         actor: str,
         reason: str = "",
     ) -> Optional[Task]:
-        """
-        Transition helper that assumes the caller already holds the per-task lock.
-        Validates all preconditions before writing a success audit.
-        """
         from_status = task.status
 
         if not task.can_transition_to(to_status):
@@ -515,6 +349,144 @@ class Master:
             return None
 
         return task
+
+    # ------------------------------------------------------------------
+    # Authorization gateway
+    # ------------------------------------------------------------------
+
+    def authorize_task(
+        self,
+        task_id: str,
+        actor: str,
+        action: str,
+    ) -> AuthorizationDecision:
+        task = self._tasks.get(task_id)
+        if task is None:
+            decision = AuthorizationDecision(
+                allowed=False,
+                reason=f"Task {task_id} not found",
+                actor=actor,
+                action=action,
+                outcome=AuthorizationOutcome.DENY,
+                reason_code="TASK_NOT_FOUND",
+            )
+            self._audit_authorization_decision(decision, task=None)
+            return decision
+
+        before = len(self._execution_control.get_decision_log())
+        decision = self._execution_control.authorize(task, actor, action)
+
+        # Audit every decision produced by this call (usually one)
+        if not self._audit_recent_decisions_since(before, task):
+            return AuthorizationDecision(
+                allowed=False,
+                reason="Authorization audit write failed; operation blocked",
+                actor=actor,
+                action=action,
+                scope=task_id,
+                outcome=AuthorizationOutcome.DENY,
+                reason_code="AUDIT_WRITE_FAILED",
+            )
+        return decision
+
+    def try_make_ready(
+        self,
+        task_id: str,
+        actor: str = "master",
+    ) -> AuthorizationDecision:
+        if not actor or not str(actor).strip():
+            return AuthorizationDecision(
+                allowed=False,
+                reason="actor is required",
+                actor=actor or "unknown",
+                action="try_make_ready",
+                outcome=AuthorizationOutcome.DENY,
+                reason_code="MISSING_ACTOR",
+            )
+
+        lock = self._get_task_lock(task_id)
+        with lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return AuthorizationDecision(
+                    allowed=False,
+                    reason="Task not found",
+                    actor=actor,
+                    action="try_make_ready",
+                    outcome=AuthorizationOutcome.DENY,
+                    reason_code="TASK_NOT_FOUND",
+                )
+
+            # Dependencies
+            for dep_id in task.dependencies:
+                dep = self._tasks.get(dep_id)
+                if dep is None or dep.status != TaskStatus.COMPLETED:
+                    self._transition_locked(
+                        task,
+                        TaskStatus.BLOCKED,
+                        actor=actor,
+                        reason=f"Waiting for dependency {dep_id}",
+                    )
+                    return AuthorizationDecision(
+                        allowed=False,
+                        reason=f"Dependency {dep_id} not completed",
+                        actor=actor,
+                        action="try_make_ready",
+                        scope=task_id,
+                        outcome=AuthorizationOutcome.DENY,
+                        reason_code="DEPENDENCY_NOT_READY",
+                    )
+
+            # Full readiness authorization (produces individual decisions)
+            before = len(self._execution_control.get_decision_log())
+            decision = self._execution_control.check_task_ready(task, actor=actor)
+
+            # Durably audit EVERY individual decision produced
+            if not self._audit_recent_decisions_since(before, task):
+                return AuthorizationDecision(
+                    allowed=False,
+                    reason="Readiness authorization audit write failed; operation blocked",
+                    actor=actor,
+                    action="try_make_ready",
+                    scope=task_id,
+                    outcome=AuthorizationOutcome.DENY,
+                    reason_code="AUDIT_WRITE_FAILED",
+                )
+
+            if not decision.allowed:
+                if decision.outcome == AuthorizationOutcome.REQUIRE_APPROVAL:
+                    self._transition_locked(
+                        task,
+                        TaskStatus.AWAITING_APPROVAL,
+                        actor=actor,
+                        reason=decision.reason or "Approval required",
+                    )
+                else:
+                    self._transition_locked(
+                        task,
+                        TaskStatus.BLOCKED,
+                        actor=actor,
+                        reason=decision.reason or "Authorization denied",
+                    )
+                return decision
+
+            success = self._transition_locked(
+                task,
+                TaskStatus.READY,
+                actor=actor,
+                reason="All checks passed",
+            )
+            if success is None:
+                return AuthorizationDecision(
+                    allowed=False,
+                    reason="Failed to transition task to READY",
+                    actor=actor,
+                    action="try_make_ready",
+                    scope=task_id,
+                    outcome=AuthorizationOutcome.DENY,
+                    reason_code="TRANSITION_FAILED",
+                )
+            return decision
 
     # ------------------------------------------------------------------
     # Status
