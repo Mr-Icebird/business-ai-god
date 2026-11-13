@@ -1,3 +1,9 @@
+"""
+BAIG MASTER dependency subsystem.
+
+Exports validation helpers and ordered task locking.
+"""
+
 from app.central.master.dependency.locking import TaskLockManager
 from app.central.master.dependency.validation import (
     DependencyValidationError,
