@@ -577,13 +577,13 @@ class ExecutionControlManager:
                 reason_code="NO_PROTECTED_ACTIONS",
             )
 
-        for action in actions:
- decision = self.authorize(
+                for action in actions:
+            decision = self.authorize(
                 task=task,
                 actor=actor,
                 action=action,
                 category=task.approval_category,
-            )
+                )
             if not decision.allowed:
                 return decision
 
