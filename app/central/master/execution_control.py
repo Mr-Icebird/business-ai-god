@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional
+from threading import RLock
 
 from app.central.models.authority import (
     ApprovalRecord,
