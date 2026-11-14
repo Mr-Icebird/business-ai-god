@@ -456,10 +456,37 @@ def authorize_task(
                         reason_code="DEPENDENCY_NOT_READY",
                     )
 
-            before = len(self._execution_control.get_decision_log())
-            decision = self._execution_control.check_task_ready(task, actor=actor)
+            
+with self._authorization_lock:
 
-            if not self._audit_recent_decisions_since(before, task):
+    before = len(
+        self._execution_control.get_decision_log()
+    )
+
+    decision = self._execution_control.check_task_ready(
+        task,
+        actor=actor,
+    )
+
+    audit_success = self._audit_recent_decisions_since(
+        before,
+        task,
+    )
+
+if not audit_success:
+    return AuthorizationDecision(
+        allowed=False,
+        reason=(
+            "Readiness authorization audit write failed; "
+            "operation blocked"
+        ),
+        actor=actor,
+        action="try_make_ready",
+        scope=task_id,
+        outcome=AuthorizationOutcome.DENY,
+        reason_code="AUDIT_WRITE_FAILED",
+    )
+    
                 return AuthorizationDecision(
                     allowed=False,
                     reason="Readiness authorization audit write failed; operation blocked",
