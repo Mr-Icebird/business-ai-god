@@ -110,6 +110,7 @@ class ExecutionControlManager:
         approval_issuer_validator: Optional[ApprovalIssuerValidator] = None,
         allow_wildcard_grants: bool = False,
     ) -> None:
+        self._lock = RLock()
         self._grants: dict[str, PermissionGrant] = {}
         self._approvals: dict[str, ApprovalRecord] = {}
         self._decision_log: list[AuthorizationDecision] = []
