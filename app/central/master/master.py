@@ -348,14 +348,18 @@ class Master:
     # ------------------------------------------------------------------
     # Authorization gateway
     # ------------------------------------------------------------------
+   
+def authorize_task(
+    self,
+    task_id: str,
+    actor: str,
+    action: str,
+) -> AuthorizationDecision:
 
-    def authorize_task(
-        self,
-        task_id: str,
-        actor: str,
-        action: str,
-    ) -> AuthorizationDecision:
+    with self._authorization_lock:
+
         task = self._tasks.get(task_id)
+
         if task is None:
             decision = AuthorizationDecision(
                 allowed=False,
@@ -365,24 +369,39 @@ class Master:
                 outcome=AuthorizationOutcome.DENY,
                 reason_code="TASK_NOT_FOUND",
             )
-            self._audit_authorization_decision(decision, task=None)
+
+            self._audit_authorization_decision(decision)
             return decision
 
-        before = len(self._execution_control.get_decision_log())
-        decision = self._execution_control.authorize(task, actor, action)
+        before = len(
+            self._execution_control.get_decision_log()
+        )
 
-        if not self._audit_recent_decisions_since(before, task):
+        decision = self._execution_control.authorize(
+            task,
+            actor,
+            action,
+        )
+
+        if not self._audit_recent_decisions_since(
+            before,
+            task,
+        ):
             return AuthorizationDecision(
                 allowed=False,
-                reason="Authorization audit write failed; operation blocked",
+                reason=(
+                    "Authorization audit write failed; "
+                    "operation blocked"
+                ),
                 actor=actor,
                 action=action,
                 scope=task_id,
                 outcome=AuthorizationOutcome.DENY,
                 reason_code="AUDIT_WRITE_FAILED",
             )
-        return decision
 
+        return decision
+    
     def try_make_ready(
         self,
         task_id: str,
