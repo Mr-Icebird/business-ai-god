@@ -348,157 +348,216 @@ class Master:
     # ------------------------------------------------------------------
     # Authorization gateway
     # ------------------------------------------------------------------
-   
-def authorize_task(
-    self,
-    task_id: str,
-    actor: str,
-    action: str,
-) -> AuthorizationDecision:
 
-    with self._authorization_lock:
+    def authorize_task(
+        self,
+        task_id: str,
+        actor: str,
+        action: str,
+    ) -> AuthorizationDecision:
+        """
+        Check whether an actor is authorized to perform an action
+        on a task.
+
+        Authorization decisions are audited before being returned.
+        Audit failure causes a fail-closed denial.
+        """
+        if not actor or not str(actor).strip():
+            return AuthorizationDecision(
+                allowed=False,
+                reason="Actor is required.",
+                actor=actor or "unknown",
+                action=action or "unknown",
+                scope=task_id,
+                outcome=AuthorizationOutcome.DENY,
+                reason_code="MISSING_ACTOR",
+            )
+
+        if not action or not str(action).strip():
+            return AuthorizationDecision(
+                allowed=False,
+                reason="Action is required.",
+                actor=actor,
+                action=action or "unknown",
+                scope=task_id,
+                outcome=AuthorizationOutcome.DENY,
+                reason_code="MISSING_ACTION",
+            )
 
         task = self._tasks.get(task_id)
 
         if task is None:
             decision = AuthorizationDecision(
                 allowed=False,
-                reason=f"Task {task_id} not found",
+                reason=f"Task {task_id} not found.",
                 actor=actor,
                 action=action,
+                scope=task_id,
                 outcome=AuthorizationOutcome.DENY,
                 reason_code="TASK_NOT_FOUND",
             )
 
-            self._audit_authorization_decision(decision)
+            if not self._audit_authorization_decision(decision):
+                return AuthorizationDecision(
+                    allowed=False,
+                    reason="Task lookup audit failed; request blocked.",
+                    actor=actor,
+                    action=action,
+                    scope=task_id,
+                    outcome=AuthorizationOutcome.DENY,
+                    reason_code="AUDIT_WRITE_FAILED",
+                )
+
             return decision
 
-        before = len(
-            self._execution_control.get_decision_log()
-        )
+        # The manager already owns an RLock. Hold it while collecting
+        # and auditing this request's decisions so another MASTER
+        # authorization request cannot interleave its decision log.
+        with self._execution_control._lock:
+            before = len(
+                self._execution_control.get_decision_log()
+            )
 
-        decision = self._execution_control.authorize(
-            task,
-            actor,
-            action,
-        )
+            decision = self._execution_control.authorize(
+                task,
+                actor,
+                action,
+            )
 
-        if not self._audit_recent_decisions_since(
-            before,
-            task,
-        ):
+            audit_success = self._audit_recent_decisions_since(
+                before,
+                task,
+            )
+
+        if not audit_success:
             return AuthorizationDecision(
                 allowed=False,
                 reason=(
                     "Authorization audit write failed; "
-                    "operation blocked"
+                    "operation blocked."
                 ),
                 actor=actor,
                 action=action,
                 scope=task_id,
+                environment=task.environment,
                 outcome=AuthorizationOutcome.DENY,
                 reason_code="AUDIT_WRITE_FAILED",
             )
 
         return decision
-    
+
     def try_make_ready(
         self,
         task_id: str,
         actor: str = "master",
     ) -> AuthorizationDecision:
+        """
+        Move a task to READY only when:
+        - The task exists.
+        - All dependencies are completed.
+        - Every required authorization check passes.
+        - Authorization decisions are successfully audited.
+        - The task's READY transition is valid and audited.
+        """
         if not actor or not str(actor).strip():
             return AuthorizationDecision(
                 allowed=False,
-                reason="actor is required",
+                reason="Actor is required.",
                 actor=actor or "unknown",
                 action="try_make_ready",
                 outcome=AuthorizationOutcome.DENY,
                 reason_code="MISSING_ACTOR",
             )
 
-        # Lock the task and all its current dependencies together
-        # (ordered acquisition prevents deadlock)
+        # Identify the task and its current dependencies before
+        # acquiring their locks.
         task_preview = self._tasks.get(task_id)
+
         lock_ids = [task_id]
+
         if task_preview is not None:
             lock_ids.extend(task_preview.dependencies)
 
+        # TaskLockManager handles ordered lock acquisition.
         with self._lock_manager.acquire(lock_ids):
             task = self._tasks.get(task_id)
+
             if task is None:
                 return AuthorizationDecision(
                     allowed=False,
-                    reason="Task not found",
+                    reason="Task not found.",
                     actor=actor,
                     action="try_make_ready",
+                    scope=task_id,
                     outcome=AuthorizationOutcome.DENY,
                     reason_code="TASK_NOT_FOUND",
                 )
 
-            # Re-check dependencies under the same locks
+            # Re-check dependencies while their locks are held.
             for dep_id in task.dependencies:
-                dep = self._tasks.get(dep_id)
-                if dep is None or dep.status != TaskStatus.COMPLETED:
+                dependency = self._tasks.get(dep_id)
+
+                if (
+                    dependency is None
+                    or dependency.status != TaskStatus.COMPLETED
+                ):
                     self._transition_locked(
                         task,
                         TaskStatus.BLOCKED,
                         actor=actor,
                         reason=f"Waiting for dependency {dep_id}",
                     )
+
                     return AuthorizationDecision(
                         allowed=False,
-                        reason=f"Dependency {dep_id} not completed",
+                        reason=f"Dependency {dep_id} not completed.",
                         actor=actor,
                         action="try_make_ready",
                         scope=task_id,
+                        environment=task.environment,
                         outcome=AuthorizationOutcome.DENY,
                         reason_code="DEPENDENCY_NOT_READY",
                     )
 
-            
-with self._authorization_lock:
+            # Authorization and its decision-log audit are kept
+            # together under the execution manager's existing lock.
+            with self._execution_control._lock:
+                before = len(
+                    self._execution_control.get_decision_log()
+                )
 
-    before = len(
-        self._execution_control.get_decision_log()
-    )
+                decision = self._execution_control.check_task_ready(
+                    task,
+                    actor=actor,
+                )
 
-    decision = self._execution_control.check_task_ready(
-        task,
-        actor=actor,
-    )
+                audit_success = self._audit_recent_decisions_since(
+                    before,
+                    task,
+                )
 
-    audit_success = self._audit_recent_decisions_since(
-        before,
-        task,
-    )
-
-if not audit_success:
-    return AuthorizationDecision(
-        allowed=False,
-        reason=(
-            "Readiness authorization audit write failed; "
-            "operation blocked"
-        ),
-        actor=actor,
-        action="try_make_ready",
-        scope=task_id,
-        outcome=AuthorizationOutcome.DENY,
-        reason_code="AUDIT_WRITE_FAILED",
-    )
-    
+            # Never allow READY when authorization auditing fails.
+            if not audit_success:
                 return AuthorizationDecision(
                     allowed=False,
-                    reason="Readiness authorization audit write failed; operation blocked",
+                    reason=(
+                        "Readiness authorization audit failed; "
+                        "task cannot become READY."
+                    ),
                     actor=actor,
                     action="try_make_ready",
                     scope=task_id,
+                    environment=task.environment,
                     outcome=AuthorizationOutcome.DENY,
                     reason_code="AUDIT_WRITE_FAILED",
                 )
 
+            # Authorization denied or approval is still required.
             if not decision.allowed:
-                if decision.outcome == AuthorizationOutcome.REQUIRE_APPROVAL:
+                if (
+                    decision.outcome
+                    == AuthorizationOutcome.REQUIRE_APPROVAL
+                ):
                     self._transition_locked(
                         task,
                         TaskStatus.AWAITING_APPROVAL,
@@ -512,24 +571,29 @@ if not audit_success:
                         actor=actor,
                         reason=decision.reason or "Authorization denied",
                     )
+
                 return decision
 
+            # Only a successfully authorized task may become READY.
             success = self._transition_locked(
                 task,
                 TaskStatus.READY,
                 actor=actor,
-                reason="All checks passed",
+                reason="All readiness checks passed.",
             )
+
             if success is None:
                 return AuthorizationDecision(
                     allowed=False,
-                    reason="Failed to transition task to READY",
+                    reason="Failed to transition task to READY.",
                     actor=actor,
                     action="try_make_ready",
                     scope=task_id,
+                    environment=task.environment,
                     outcome=AuthorizationOutcome.DENY,
                     reason_code="TRANSITION_FAILED",
                 )
+
             return decision
 
     # ------------------------------------------------------------------
