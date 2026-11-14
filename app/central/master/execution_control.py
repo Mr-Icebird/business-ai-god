@@ -540,7 +540,7 @@ class ExecutionControlManager:
             reason_code="GRANT_VALID",
             grant_id=matched_grant.grant_id,
         )
-
+ 
     def check_task_ready(
         self,
         task: Task,
@@ -548,8 +548,11 @@ class ExecutionControlManager:
     ) -> AuthorizationDecision:
         """
         Check every required permission independently.
-        Returns the first failing decision, or a final ALLOW aggregate.
-        Individual decisions are already in the decision log for durable audit.
+
+        Returns the first failing decision, or a final ALLOW
+        aggregate when every required action passes.
+
+        Individual decisions remain available for durable audit.
         """
         if not isinstance(task, Task):
             raise TypeError("task must be a Task instance.")
@@ -558,6 +561,7 @@ class ExecutionControlManager:
             task.approval_category
             and requires_explicit_approval(task.approval_category)
         )
+
         actions = tuple(task.required_permissions)
 
         if not actions and mandatory:
@@ -577,13 +581,14 @@ class ExecutionControlManager:
                 reason_code="NO_PROTECTED_ACTIONS",
             )
 
-                for action in actions:
+        for action in actions:
             decision = self.authorize(
                 task=task,
                 actor=actor,
                 action=action,
                 category=task.approval_category,
-                )
+            )
+
             if not decision.allowed:
                 return decision
 
@@ -598,7 +603,7 @@ class ExecutionControlManager:
             required_approval=mandatory,
             category=task.approval_category,
         )
-
+        
     # --------------------------------------------------------
     # Lookup helpers
     # --------------------------------------------------------
